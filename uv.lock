@@ -2537,6 +2537,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "ipykernel" },
+    { name = "pandas" },
     { name = "seaborn" },
     { name = "vbi", extra = ["all"] },
 ]
@@ -2544,6 +2545,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "ipykernel", specifier = ">=7.1.0" },
+    { name = "pandas", specifier = ">=2.3.3" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "vbi", extras = ["all"], specifier = ">=0.3" },
 ]
