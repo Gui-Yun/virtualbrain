@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+import time
 
 import numpy as np
 
@@ -334,9 +335,184 @@ def extract_region_trace(
     return times, trace
 
 
+def region_indices_from_labels(connectivity, target_labels: Sequence[str]) -> np.ndarray:
+    region_labels = [str(x) for x in connectivity.region_labels.tolist()]
+    indices = []
+    for label in target_labels:
+        try:
+            indices.append(region_labels.index(str(label)))
+        except ValueError as exc:
+            raise ValueError(f"Region label `{label}` not found.") from exc
+    return np.asarray(indices, dtype=int)
+
+
+def extract_mean_region_trace(
+    times: np.ndarray,
+    values: np.ndarray,
+    simulator,
+    region_labels: Sequence[str],
+    variable_name: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    traces = []
+    for label in region_labels:
+        _, trace = extract_region_trace(
+            times=times,
+            values=values,
+            simulator=simulator,
+            region_label=label,
+            variable_name=variable_name,
+        )
+        traces.append(trace)
+    return times, np.mean(np.asarray(traces), axis=0)
+
+
+def calibrate_drive_to_reference(
+    drive: Sequence[float],
+    reference_trace: Sequence[float],
+    gain: float = 1.0,
+) -> np.ndarray:
+    drive = np.asarray(drive, dtype=np.float64)
+    reference_trace = np.asarray(reference_trace, dtype=np.float64)
+
+    drive_mean = float(np.mean(drive))
+    drive_std = float(np.std(drive))
+    ref_mean = float(np.mean(reference_trace))
+    ref_std = float(np.std(reference_trace))
+
+    if drive_std <= 1e-12:
+        standardized = np.zeros_like(drive)
+    else:
+        standardized = (drive - drive_mean) / drive_std
+
+    return ref_mean + gain * max(ref_std, 1e-6) * standardized
+
+
+def map_drive_to_reference_quantiles(
+    drive: Sequence[float],
+    reference_trace: Sequence[float],
+    lower_quantile: float = 0.1,
+    upper_quantile: float = 0.9,
+) -> np.ndarray:
+    drive = np.asarray(drive, dtype=np.float64)
+    reference_trace = np.asarray(reference_trace, dtype=np.float64)
+
+    lo = float(np.quantile(reference_trace, lower_quantile))
+    hi = float(np.quantile(reference_trace, upper_quantile))
+    return lo + drive * (hi - lo)
+
+
+def _collect_results_from_iterator(simulator, data_iterator, simulation_length_ms: float):
+    ts, xs = [], []
+    for _ in simulator.monitors:
+        ts.append([])
+        xs.append([])
+
+    wall_time_start = time.time()
+    for data in data_iterator:
+        for tl, xl, t_x in zip(ts, xs, data):
+            if t_x is not None:
+                t, x = t_x
+                tl.append(t)
+                xl.append(x)
+
+    elapsed_wall_time = time.time() - wall_time_start
+    simulator.log.info(
+        "%.3f s elapsed, %.3fx real time",
+        elapsed_wall_time,
+        elapsed_wall_time * 1e3 / simulation_length_ms,
+    )
+
+    for i in range(len(ts)):
+        ts[i] = np.asarray(ts[i])
+        xs[i] = np.asarray(xs[i])
+
+    return list(zip(ts, xs))
+
+
+def run_tvb_with_soft_replacement(
+    simulator,
+    simulation_length_ms: float,
+    sample_times_ms: Sequence[float],
+    sample_values: Sequence[float],
+    target_labels: Sequence[str] = ("rV1", "rV2", "lV1", "lV2"),
+    blend_alpha: float = 0.35,
+    variable_index: int = 0,
+):
+    sample_times_ms = np.asarray(sample_times_ms, dtype=np.float64).reshape(-1)
+    sample_values = np.asarray(sample_values, dtype=np.float64).reshape(-1)
+    if sample_times_ms.shape != sample_values.shape:
+        raise ValueError("Sample times and values must have the same shape.")
+    if not 0.0 <= blend_alpha <= 1.0:
+        raise ValueError("blend_alpha must be in [0, 1].")
+
+    simulator.configure()
+    target_indices = region_indices_from_labels(simulator.connectivity, target_labels)
+
+    local_coupling = simulator._prepare_local_coupling()
+    stimulus = simulator._prepare_stimulus()
+    state = simulator.current_state
+    start_step = simulator.current_step + 1
+    node_coupling = simulator._loop_compute_node_coupling(start_step)
+    n_steps = int(np.ceil(simulation_length_ms / simulator.integrator.dt))
+
+    replacement_times = []
+    replacement_values = []
+
+    def iterator():
+        nonlocal state, node_coupling
+        for step in range(start_step, start_step + n_steps):
+            simulator._loop_update_stimulus(step, stimulus)
+            state = simulator.integrate_next_step(
+                state,
+                simulator.model,
+                node_coupling,
+                local_coupling,
+                stimulus,
+            )
+
+            current_time_ms = step * simulator.integrator.dt
+            target_value = float(
+                np.interp(
+                    current_time_ms,
+                    sample_times_ms,
+                    sample_values,
+                    left=sample_values[0],
+                    right=sample_values[-1],
+                )
+            )
+
+            previous_values = state[variable_index, target_indices, 0]
+            state[variable_index, target_indices, 0] = (
+                (1.0 - blend_alpha) * previous_values + blend_alpha * target_value
+            )
+
+            replacement_times.append(current_time_ms)
+            replacement_values.append(target_value)
+
+            simulator._loop_update_history(step, state)
+            node_coupling = simulator._loop_compute_node_coupling(step + 1)
+            output = simulator._loop_monitor_output(step, state, node_coupling)
+            if output is not None:
+                yield output
+
+        simulator.current_state = state
+        simulator.current_step = simulator.current_step + n_steps
+
+    results = _collect_results_from_iterator(simulator, iterator(), simulation_length_ms)
+    return results, np.asarray(replacement_times), np.asarray(replacement_values)
+
+
 @dataclass
 class CouplingSummary:
     frame_times_ms: np.ndarray
     fnn_drive: np.ndarray
     target_labels: tuple[str, ...]
     simulation_length_ms: float
+
+
+@dataclass
+class SoftReplacementSummary:
+    replacement_times_ms: np.ndarray
+    replacement_values: np.ndarray
+    target_labels: tuple[str, ...]
+    blend_alpha: float
