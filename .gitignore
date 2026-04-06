@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local model weights and generated notebook outputs
+notebook/data/fnn/
+notebook/output/fnn_validation/
+notebook/output/fnn_tvb_one_way_coupling/
+notebook/outputs/fnn_*exec*.ipynb
